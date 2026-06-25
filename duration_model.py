@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import Lasso
 from scipy.optimize import minimize
+import osqp
+import scipy.sparse as sp
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -97,17 +99,81 @@ class DurationModel:
 
         return selected_factors
 
-    def _constrained_wls(self, fund_returns, index_returns, time_weights):
+    def _solve_qp_osqp(self, X, y, weights, min_lev=None, max_lev=None):
         """
-        带约束的加权最小二乘法
+        使用OSQP求解带截距项的约束WLS
 
         参数:
-        fund_returns: 基金收益率Series
-        index_returns: 指数收益率DataFrame
-        time_weights: 时间权重
+            X: 设计矩阵 (n_obs, n_factors)
+            y: 响应变量 (n_obs,)
+            weights: 权重 (n_obs,)
+            min_lev: 最小杠杆率
+            max_lev: 最大杠杆率
 
         返回:
-        dict: 回归系数
+            tuple: (截距, 系数数组) 或 (None, None)
+        """
+        if min_lev is None:
+            min_lev = self.min_lev
+        if max_lev is None:
+            max_lev = self.max_lev
+
+        # 构造设计矩阵 Z = [1, X]
+        Z = np.column_stack([np.ones(len(y)), X])
+        n_params = Z.shape[1]  # = n_factors + 1
+        n_factors = X.shape[1]
+
+        # 构造权重矩阵
+        W = np.diag(weights)
+
+        # QP矩阵: P = 2 * Z' * W * Z
+        P = 2 * Z.T @ W @ Z
+        q_vec = -2 * Z.T @ W @ y
+
+        # 约束矩阵 A
+        # 行0: 截距无约束
+        # 行1~n_factors: β的非负约束
+        # 行 n_factors+1: 上限约束 Σβ_i <= max_lev
+        # 行 n_factors+2: 下限约束 -Σβ_i <= -min_lev
+        A_rows = 1 + n_factors + 2
+        A = np.zeros((A_rows, n_params))
+
+        A[0, 0] = 1  # 截距行
+        A[1:n_factors+1, 1:] = -np.eye(n_factors)  # 非负约束
+        A[n_factors+1, 1:] = 1  # 上限
+        A[n_factors+2, 1:] = -1  # 下限
+
+        # 约束边界
+        INF = 1e10
+        l = np.array([-INF] + [-INF] * n_factors + [-INF, -INF])
+        u = np.array([INF] + [0] * n_factors + [max_lev, -min_lev])
+
+        # 转为稀疏矩阵
+        P_sparse = sp.csr_matrix(P)
+        A_sparse = sp.csr_matrix(A)
+
+        # 求解
+        prob = osqp.OSQP()
+        prob.setup(P=P_sparse, q=q_vec, A=A_sparse, l=l, u=u,
+                   eps_abs=1e-9, eps_rel=1e-9, verbose=False)
+        result = prob.solve()
+
+        if result.info.status != 'solved':
+            return None, None
+
+        return result.x[0], result.x[1:]  # (截距, 系数)
+
+    def _constrained_wls(self, fund_returns, index_returns, time_weights):
+        """
+        带约束的加权最小二乘法（使用OSQP求解器）
+
+        参数:
+            fund_returns: 基金收益率Series
+            index_returns: 指数收益率DataFrame
+            time_weights: 时间权重（已废弃，保留参数以兼容）
+
+        返回:
+            dict: 回归系数
         """
         # 对齐数据
         aligned_data = pd.DataFrame({
@@ -123,86 +189,18 @@ class DurationModel:
         n_factors = X.shape[1]
         n_obs = X.shape[0]
 
-        # 重新生成权重，确保与对齐后的数据长度匹配
+        # 根据对齐后的数据长度生成时间权重
         adjusted_weights = self._get_time_weights(n_obs)
 
-        # 标准化数据（与Lasso保持一致，解决不同指数波动率差异导致的条件数过大问题）
-        from sklearn.preprocessing import StandardScaler
-        scaler_X = StandardScaler()
-        scaler_y = StandardScaler()
-        X_std = scaler_X.fit_transform(X)
-        y_std = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+        # 使用OSQP求解
+        intercept, coefficients = self._solve_qp_osqp(X, y, adjusted_weights)
 
-        # 保存尺度信息用于反标准化
-        X_scale = scaler_X.scale_
-        y_scale = scaler_y.scale_[0]
-
-        # 目标函数：加权残差平方和
-        def objective(params):
-            residuals = y - X @ params
-            weighted_residuals = residuals * np.sqrt(adjusted_weights)
-            return np.sum(weighted_residuals ** 2)
-
-        # 每个参数都大于0
-        bounds = [(1e-6, None)] * n_factors
-
-        # 先尝试无约束的WLS解（使用标准化数据，与Lasso保持一致）
-        # 使用解析解: (X'WX)^-1 X'Wy
-        W = np.diag(adjusted_weights)
-        XtWX = X_std.T @ W @ X_std
-        XWy = X_std.T @ W @ y_std
-
-        try:
-            # 检查矩阵是否可逆
-            if np.linalg.cond(XtWX) < 1e10:
-                wls_solution = np.linalg.solve(XtWX, XWy)
-
-                # 反标准化：从标准化空间转换回原始尺度
-                # 对于标准化模型 y_std = X_std @ β_std
-                # 原始尺度系数: β = (y_scale / X_scale) * β_std
-                wls_solution = wls_solution * (y_scale / X_scale)
-
-                # 确保解非负
-                wls_solution = np.maximum(wls_solution, 1e-6)
-                wls_sum = np.sum(wls_solution)
-
-                # 如果无约束解满足约束条件，直接使用
-                if self.min_lev <= wls_sum <= self.max_lev:
-                    return dict(zip(index_returns.columns, wls_solution))
-            else:
-                wls_solution = None
-        except:
-            wls_solution = None
-
-        # 如果无约束解不满足约束，使用比例缩放策略
-        # 原因：当目标函数平坦时，优化器无法找到更好的解
-        # 策略：保持WLS解的相对权重比例，缩放到约束范围
-        if wls_solution is not None:
-            current_sum = np.sum(wls_solution)
-
-            # 计算缩放因子，使结果落在约束范围内
-            if current_sum < self.min_lev:
-                # 缩放到约束下限附近
-                target_sum = (self.min_lev + self.max_lev) / 2  # 中点
-                scale_factor = target_sum / current_sum
-                final_params = wls_solution * scale_factor
-            elif current_sum > self.max_lev:
-                # 缩放到约束上限附近
-                target_sum = (self.min_lev + self.max_lev) / 2
-                scale_factor = target_sum / current_sum
-                final_params = wls_solution * scale_factor
-            else:
-                # 已经在约束范围内
-                final_params = wls_solution
-
-            # 确保非负
-            final_params = np.maximum(final_params, 1e-6)
-
-            return dict(zip(index_returns.columns, final_params))
-
-        # 如果没有WLS解，使用等权
-        equal_weight = (self.min_lev + self.max_lev) / 2 / n_factors
-        final_params = np.full(n_factors, equal_weight)
+        if coefficients is None:
+            # OSQP求解失败，使用等权作为后备
+            equal_weight = (self.min_lev + self.max_lev) / 2 / n_factors
+            final_params = np.full(n_factors, equal_weight)
+        else:
+            final_params = coefficients
 
         return dict(zip(index_returns.columns, final_params))
 

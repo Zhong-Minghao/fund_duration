@@ -120,6 +120,59 @@ class WindDataFetcher:
 
         return result
 
+    def _get_latest_rpt_date(self, target_date):
+        """
+        获取不超过target_date的最近季度末日期（用于Wind wss的rptDate参数）
+
+        返回:
+        str: 格式 'YYYYMMDD'，如 '20251231'；无法确定时返回 None
+        """
+        target_dt = pd.to_datetime(target_date)
+        year = target_dt.year
+
+        candidates = []
+        for y in [year - 1, year]:
+            for month, day in [(3, 31), (6, 30), (9, 30), (12, 31)]:
+                d = pd.Timestamp(y, month, day)
+                if d <= target_dt:
+                    candidates.append(d)
+
+        if not candidates:
+            return None
+
+        return max(candidates).strftime('%Y%m%d')
+
+    def get_fund_reported_duration(self, fund_code, target_date):
+        """
+        通过Wind wss获取基金最近一期季报披露的组合久期
+
+        参数:
+        fund_code: 基金代码，如 '000015.OF'
+        target_date: 目标日期 'YYYY-MM-DD'
+
+        返回:
+        float: 披露久期（年）；Wind返回错误或数据缺失时返回 None
+        """
+        if not self.connected:
+            return None
+
+        rpt_date = self._get_latest_rpt_date(target_date)
+        if rpt_date is None:
+            return None
+
+        try:
+            data = w.wss(fund_code, "risk_duration", f"rptDate={rpt_date}")
+            if data.ErrorCode != 0:
+                return None
+            if not data.Data or not data.Data[0]:
+                return None
+            value = data.Data[0][0]
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
     def _remove_outliers(self, df, threshold=3.0):
         """
         移除异常值

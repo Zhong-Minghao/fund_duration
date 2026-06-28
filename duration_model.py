@@ -18,7 +18,7 @@ class DurationModel:
 
     def __init__(self,
                  index_processor,
-                 window=30,
+                 window=15,
                  lasso_alpha=0.1,
                  min_lev=0.8,
                  max_lev=1.4):
@@ -204,7 +204,44 @@ class DurationModel:
 
         return dict(zip(index_returns.columns, final_params))
 
-    def calculate_fund_duration(self, fund_nav_df, index_codes, target_date):
+    def _anchor_factor_by_duration(self, selected_factors, all_index_codes,
+                                   reported_duration, target_date, fund_code=None):
+        """
+        当Lasso只选出<=1个因子时，在候选指数池中找久期最近的指数作为锚定因子补充进来。
+
+        参数:
+        selected_factors: Lasso已选因子列表
+        all_index_codes: 全部候选指数代码列表
+        reported_duration: Wind披露的基金组合久期
+        target_date: 目标日期
+        fund_code: 基金代码（仅用于日志）
+
+        返回:
+        list: 可能扩充后的因子列表
+        """
+        best_code = None
+        best_diff = float('inf')
+
+        for code in all_index_codes:
+            dur = self.index_processor.get_latest_duration(code, target_date)
+            if dur is None or np.isnan(dur):
+                continue
+            diff = abs(dur - reported_duration)
+            if diff < best_diff:
+                best_diff = diff
+                best_code = code
+
+        if best_code is None:
+            return selected_factors
+
+        if best_code not in selected_factors:
+            return selected_factors + [best_code]
+        else:
+            print(f"[警告] {fund_code} {target_date} 回归自变量只有1个指数 {best_code}，且该指数已是最近久期匹配，无额外因子可补充")
+            return selected_factors
+
+    def calculate_fund_duration(self, fund_nav_df, index_codes, target_date,
+                                reported_duration=None, fund_code=None):
         """
         计算单只基金在目标日期的久期
 
@@ -251,6 +288,14 @@ class DurationModel:
 
         # Lasso筛选因子
         selected_factors = self._lasso_select_factors(fund_returns, index_returns)
+
+        # 单因子退化兜底：Lasso<=1个因子时，用Wind披露久期锚定额外因子
+        if len(selected_factors) <= 1 and reported_duration is not None:
+            selected_factors = self._anchor_factor_by_duration(
+                selected_factors, index_codes, reported_duration, target_date,
+                fund_code=fund_code
+            )
+
         index_returns_selected = index_returns[selected_factors]
 
         # 生成时间权重
@@ -352,9 +397,16 @@ class FundDurationCalculator:
                     if fund_nav_df is None:
                         continue
 
+                    # 获取Wind披露久期（Lasso单因子退化时用于锚定额外因子）
+                    reported_duration = self.wind_fetcher.get_fund_reported_duration(
+                        fund_code, target_date
+                    )
+
                     # 计算久期
                     duration = self.duration_model.calculate_fund_duration(
-                        fund_nav_df, index_codes, target_date
+                        fund_nav_df, index_codes, target_date,
+                        reported_duration=reported_duration,
+                        fund_code=fund_code
                     )
 
                     if duration is not None:
@@ -388,9 +440,16 @@ class FundDurationCalculator:
                     if fund_nav_df is None:
                         continue
 
+                    # 获取Wind披露久期（Lasso单因子退化时用于锚定额外因子）
+                    reported_duration = self.wind_fetcher.get_fund_reported_duration(
+                        fund_code, target_date
+                    )
+
                     # 计算久期
                     duration = self.duration_model.calculate_fund_duration(
-                        fund_nav_df, index_codes, target_date
+                        fund_nav_df, index_codes, target_date,
+                        reported_duration=reported_duration,
+                        fund_code=fund_code
                     )
 
                     if duration is not None:

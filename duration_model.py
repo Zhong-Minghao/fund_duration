@@ -21,7 +21,8 @@ class DurationModel:
                  window=15,
                  lasso_alpha=0.1,
                  min_lev=0.8,
-                 max_lev=1.4):
+                 max_lev=1.4,
+                 outlier_threshold=2.5):
         """
         初始化
 
@@ -31,12 +32,14 @@ class DurationModel:
         lasso_alpha: Lasso正则化参数
         min_lev: 最小杠杆率
         max_lev: 最大杠杆率
+        outlier_threshold: OLS残差标准化阈值，超过此值的数据点整行剔除（默认2.5）
         """
         self.index_processor = index_processor
         self.window = window
         self.lasso_alpha = lasso_alpha
         self.min_lev = min_lev
         self.max_lev = max_lev
+        self.outlier_threshold = outlier_threshold
 
     def update_index_processor(self, index_processor):
         """更新index_processor引用"""
@@ -162,6 +165,38 @@ class DurationModel:
             return None, None
 
         return result.x[0], result.x[1:]  # (截距, 系数)
+
+    def _remove_regression_outliers(self, fund_returns, index_returns):
+        """
+        基于 OLS 标准化残差，剔除 (y, x1, x2, ...) 联合关系中偏离正常状态的数据点。
+        若剔除后剩余观测点不足则回退到原始数据。
+        """
+        n_obs = len(fund_returns)
+        n_factors = index_returns.shape[1]
+        min_obs = max(8, n_factors + 3)
+
+        if n_obs <= min_obs:
+            return fund_returns, index_returns
+
+        y = fund_returns.values
+        X = np.column_stack([np.ones(n_obs), index_returns.values])
+
+        try:
+            beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+            residuals = y - X @ beta
+            sigma = residuals.std()
+            if sigma < 1e-10:
+                return fund_returns, index_returns
+            std_resid = residuals / sigma
+
+            mask = np.abs(std_resid) <= self.outlier_threshold
+
+            if mask.sum() < min_obs:
+                return fund_returns, index_returns
+
+            return fund_returns.iloc[mask], index_returns.iloc[mask]
+        except Exception:
+            return fund_returns, index_returns
 
     def _constrained_wls(self, fund_returns, index_returns, time_weights):
         """
@@ -297,6 +332,11 @@ class DurationModel:
             )
 
         index_returns_selected = index_returns[selected_factors]
+
+        # 剔除回归离群点：(y, x1, x2, ...) 联合关系偏离的数据点
+        fund_returns, index_returns_selected = self._remove_regression_outliers(
+            fund_returns, index_returns_selected
+        )
 
         # 生成时间权重
         time_weights = self._get_time_weights(len(fund_returns))

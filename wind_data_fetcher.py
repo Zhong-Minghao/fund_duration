@@ -19,9 +19,15 @@ except AttributeError:
 class WindDataFetcher:
     """Wind数据获取类"""
 
-    def __init__(self):
-        """初始化Wind连接"""
+    def __init__(self, cache=None):
+        """
+        初始化Wind连接
+
+        参数:
+        cache: WindDataCache实例，传入后自动启用本地缓存（可选）
+        """
         self.connected = False
+        self.cache = cache
         self.connect()
 
     def connect(self):
@@ -69,7 +75,7 @@ class WindDataFetcher:
 
     def get_fund_nav_smoothed(self, fund_code, start_date, end_date, window=5):
         """
-        获取平滑后的基金净值数据
+        获取平滑后的基金净值数据（优先读取本地缓存）
 
         参数:
         fund_code: 基金代码
@@ -80,7 +86,13 @@ class WindDataFetcher:
         返回:
         DataFrame: 平滑后的净值数据
         """
-        df = self.get_fund_nav(fund_code, start_date, end_date)
+        if self.cache and self.cache.check_nav_coverage(fund_code, start_date, end_date):
+            df = self.cache.read_nav(fund_code, start_date, end_date)
+        else:
+            df = self.get_fund_nav(fund_code, start_date, end_date)
+            if df is not None and self.cache:
+                self.cache.write_nav(fund_code, df)
+
         if df is None:
             return None
 
@@ -160,6 +172,9 @@ class WindDataFetcher:
         if rpt_date is None:
             return None
 
+        if self.cache and self.cache.check_duration_exists(fund_code, rpt_date):
+            return self.cache.read_duration(fund_code, rpt_date)
+
         try:
             data = w.wss(fund_code, "risk_duration", f"rptDate={rpt_date}")
             if data.ErrorCode != 0:
@@ -169,7 +184,10 @@ class WindDataFetcher:
             value = data.Data[0][0]
             if value is None or (isinstance(value, float) and np.isnan(value)):
                 return None
-            return float(value)
+            result = float(value)
+            if self.cache:
+                self.cache.write_duration_batch(rpt_date, {fund_code: result})
+            return result
         except Exception:
             return None
 

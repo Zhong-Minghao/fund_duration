@@ -198,46 +198,432 @@ class DurationModel:
         except Exception:
             return fund_returns, index_returns
 
-    def _constrained_wls(self, fund_returns, index_returns, time_weights):
+    def _detect_boundary_status(self, coefficients, min_lev=None, max_lev=None, tol=1e-4):
+        """
+        检测WLS解是否在边界上
+
+        参数:
+            coefficients: 回归系数数组
+            min_lev: 最小杠杆率
+            max_lev: 最大杠杆率
+            tol: 容差
+
+        返回:
+            str: 'upper' | 'lower' | 'interior' | None
+        """
+        if min_lev is None:
+            min_lev = self.min_lev
+        if max_lev is None:
+            max_lev = self.max_lev
+
+        total = np.sum(coefficients)
+        if abs(total - max_lev) < tol:
+            return 'upper'
+        elif abs(total - min_lev) < tol:
+            return 'lower'
+        else:
+            return 'interior'
+
+    def _sort_factors_by_duration(self, factor_codes, target_date):
+        """
+        按久期从小到大排序因子
+
+        参数:
+            factor_codes: 因子代码列表
+            target_date: 目标日期
+
+        返回:
+            list: [(code, duration), ...] sorted by duration ascending
+        """
+        factor_durations = []
+        for code in factor_codes:
+            dur = self.index_processor.get_latest_duration(code, target_date)
+            if dur is not None and not np.isnan(dur):
+                factor_durations.append((code, dur))
+
+        return sorted(factor_durations, key=lambda x: x[1])
+
+    def _calculate_p_values(self, X, y, weights, coefficients):
+        """
+        计算WLS回归系数的P值
+
+        参数:
+            X: 设计矩阵 (n_obs, n_factors)
+            y: 响应变量
+            weights: 权重
+            coefficients: 回归系数
+
+        返回:
+            dict: {factor_index: p_value}
+        """
+        from scipy import stats
+
+        n_obs, n_factors = X.shape
+
+        # 构造权重矩阵
+        W = np.diag(weights)
+
+        # 计算残差
+        y_pred = X @ coefficients
+        residuals = y - y_pred
+
+        # 计算残差标准误（加权）
+        dof = n_obs - n_factors - 1  # 自由度
+        if dof <= 0:
+            return {i: 1.0 for i in range(n_factors)}  # 自由度不足，返回最大P值
+
+        # σ² = (residuals' * W * residuals) / dof
+        sigma2 = (residuals.T @ W @ residuals) / dof
+
+        # 计算系数协方差矩阵: Var(β) = σ² * (X' * W * X)^(-1)
+        XtW = X.T @ W
+        try:
+            XtWX_inv = np.linalg.inv(XtW @ X)
+        except np.linalg.LinAlgError:
+            # 矩阵奇异，返回最大P值
+            return {i: 1.0 for i in range(n_factors)}
+
+        cov_matrix = sigma2 * XtWX_inv
+
+        # 提取对角线元素（各系数的方差）
+        variances = np.diag(cov_matrix)
+
+        # 计算t统计量和P值
+        p_values = {}
+        for i in range(n_factors):
+            if variances[i] <= 0 or coefficients[i] == 0:
+                p_values[i] = 1.0
+            else:
+                se = np.sqrt(variances[i])  # 标准误
+                t_stat = coefficients[i] / se
+                # 双边检验的P值
+                p_values[i] = 2 * (1 - stats.t.cdf(abs(t_stat), df=dof))
+
+        return p_values
+
+    def _select_factor_by_duration_direction(self, current_factors, boundary_type,
+                                            candidate_codes, target_date):
+        """
+        基于久期方向选择因子（残差分析失败时的兜底方案）
+
+        参数:
+            current_factors: 当前因子列表
+            boundary_type: 'upper' 或 'lower'
+            candidate_codes: 候选指数代码列表
+            target_date: 目标日期
+
+        返回:
+            str: 要添加的指数代码，或None
+        """
+        candidate_durations = {}
+        for code in candidate_codes:
+            if code in current_factors:
+                continue
+            dur = self.index_processor.get_latest_duration(code, target_date)
+            if dur is not None and not np.isnan(dur):
+                candidate_durations[code] = dur
+
+        if not candidate_durations:
+            return None
+
+        if boundary_type == 'upper':
+            # 上界：需要更大久期的指数
+            return max(candidate_durations, key=candidate_durations.get)
+        else:
+            # 下界：需要更小久期的指数
+            return min(candidate_durations, key=candidate_durations.get)
+
+    def _select_factor_to_add(self, fund_returns, index_returns, coefficients,
+                             boundary_type, candidate_codes, target_date, fund_code=None):
+        """
+        选择要添加的因子（基于残差分析）
+
+        参数:
+            fund_returns: 基金收益率Series
+            index_returns: 当前指数收益率DataFrame
+            coefficients: 当前回归系数
+            boundary_type: 'upper' 或 'lower'
+            candidate_codes: 候选指数代码列表
+            target_date: 目标日期
+            fund_code: 基金代码（用于日志）
+
+        返回:
+            str: 要添加的指数代码，或None
+        """
+        # 计算残差
+        X = index_returns.values
+        y = fund_returns.values
+        y_pred = X @ coefficients
+        residuals = y - y_pred
+
+        # 获取候选指数的收益率数据
+        candidate_returns = {}
+        start_date = fund_returns.index[0].strftime('%Y-%m-%d')
+        end_date = fund_returns.index[-1].strftime('%Y-%m-%d')
+
+        for code in candidate_codes:
+            if code in index_returns.columns:
+                continue  # 跳过已使用的因子
+            prices = self.index_processor.get_index_prices([code], start_date, end_date)
+            if prices.empty:
+                continue
+            ret = prices.pct_change().dropna()
+            # 对齐日期
+            aligned_ret = ret.reindex(fund_returns.index).fillna(0)
+            candidate_returns[code] = aligned_ret.values.flatten()
+
+        if not candidate_returns:
+            return None
+
+        # 计算各候选指数与残差的相关性
+        correlations = {}
+        for code, ret in candidate_returns.items():
+            # 确保长度一致
+            min_len = min(len(residuals), len(ret))
+            if min_len < 3:
+                continue
+            corr = np.corrcoef(residuals[:min_len], ret[:min_len])[0, 1]
+            if not np.isnan(corr):
+                correlations[code] = corr
+
+        if not correlations:
+            # 残差分析失败，回退到久期方向选择
+            if fund_code:
+                print(f"[残差分析] {fund_code} {target_date}: 残差分析失败，回退到久期方向选择")
+            return self._select_factor_by_duration_direction(
+                index_returns.columns.tolist(), boundary_type,
+                candidate_codes, target_date
+            )
+
+        # 残差分析成功
+        if fund_code:
+            corr_str = ", ".join([f"{k}={v:.2f}" for k, v in correlations.items()])
+            print(f"[残差分析] {fund_code} {target_date}: 与残差的相关性 [{corr_str}]")
+
+        if boundary_type == 'upper':
+            # 上界：选正相关性最强的（加它能通过增加权重提升拟合）
+            selected = max(correlations, key=correlations.get)
+            if fund_code:
+                print(f"[残差分析] {fund_code} {target_date}: 上界，选正相关最强的 {selected} (相关={correlations[selected]:.2f})")
+            return selected
+        else:
+            # 下界：选负相关性最强的（加它能通过减少权重提升拟合）
+            selected = min(correlations, key=correlations.get)
+            if fund_code:
+                print(f"[残差分析] {fund_code} {target_date}: 下界，选负相关最强的 {selected} (相关={correlations[selected]:.2f})")
+            return selected
+
+    def _expand_factor_pool(self, fund_returns, index_returns, coefficients,
+                            boundary_type, all_candidate_codes, target_date, fund_code=None):
+        """
+        根据边界类型扩展因子池
+
+        混合策略：
+        1. 添加因子：用残差分析（久期方向兜底）
+        2. 移除因子：用P值，移除P值最大的
+
+        注意：当无法添加新因子时，仍然会移除P值大的因子（因子数量减少）
+        直到只剩1个因子时才终止迭代
+
+        参数:
+            fund_returns: 基金收益率Series
+            index_returns: 当前指数收益率DataFrame
+            coefficients: 当前回归系数数组
+            boundary_type: 'upper' 或 'lower'
+            all_candidate_codes: 全部候选指数代码列表
+            target_date: 目标日期
+            fund_code: 基金代码（用于日志）
+
+        返回:
+            tuple: (new_factors, should_continue, p_value_dict)
+        """
+        current_factors = index_returns.columns.tolist()
+
+        # 如果只剩1个因子，无法继续
+        if len(current_factors) <= 1:
+            return current_factors, False, {}
+
+        # 步骤1：计算P值，决定移除哪个因子
+        X = index_returns.values
+        y = fund_returns.values
+        n_obs = X.shape[0]
+        adjusted_weights = self._get_time_weights(n_obs)
+
+        p_values = self._calculate_p_values(X, y, adjusted_weights, coefficients)
+
+        # 找到P值最大的因子索引
+        max_p_index = max(p_values, key=p_values.get)
+        factor_to_remove = current_factors[max_p_index]
+
+        if fund_code:
+            print(f"[P值分析] {fund_code} {target_date}: 移除P值最大的因子 {factor_to_remove} (P值={p_values[max_p_index]:.3f})")
+
+        # 步骤2：选择要添加的因子
+        factor_to_add = self._select_factor_to_add(
+            fund_returns, index_returns, coefficients,
+            boundary_type, all_candidate_codes, target_date, fund_code
+        )
+
+        # 步骤3：构建新的因子池
+        new_factors = [f for f in current_factors if f != factor_to_remove]
+
+        if factor_to_add is not None:
+            # 有可添加的因子
+            new_factors.append(factor_to_add)
+            should_continue = True
+            if fund_code:
+                add_dur = self.index_processor.get_latest_duration(factor_to_add, target_date)
+                print(f"[因子选择] {fund_code} {target_date}: 添加因子 {factor_to_add} (久期={add_dur:.2f})")
+        else:
+            # 没有可添加的因子，仍然移除P值大的因子
+            # 因子数量减少1个，继续迭代（直到只剩1个）
+            should_continue = len(new_factors) > 1
+            if fund_code:
+                if boundary_type == 'upper':
+                    print(f"[因子选择] {fund_code} {target_date}: 无更大久期因子可选（候选池已穷尽）")
+                else:
+                    print(f"[因子选择] {fund_code} {target_date}: 无更小久期因子可选（候选池已穷尽）")
+
+        return new_factors, should_continue, p_values
+
+    def _iterative_constrained_wls(self, fund_returns, index_returns,
+                                  target_date=None, fund_code=None, max_iterations=10):
+        """
+        迭代带约束的WLS，当解在边界上时动态调整因子池
+
+        混合策略：
+        1. 添加因子：用残差分析（久期方向兜底）
+        2. 移除因子：用P值，移除P值最大的
+
+        参数:
+            fund_returns: 基金收益率Series
+            index_returns: 指数收益率DataFrame（初始候选池）
+            target_date: 目标日期
+            fund_code: 基金代码（用于日志）
+            max_iterations: 最大迭代次数
+
+        返回:
+            dict: {factor_code: coefficient}
+        """
+        all_candidate_codes = index_returns.columns.tolist()
+        current_factors = all_candidate_codes.copy()
+
+        if fund_code:
+            print(f"[开始] {fund_code} {target_date} 初始因子池({len(current_factors)}个): {current_factors}")
+
+        for iteration in range(max_iterations):
+            # 当前因子池的收益率
+            current_index_returns = index_returns[current_factors]
+
+            # 对齐数据
+            aligned_data = pd.DataFrame({
+                'fund': fund_returns
+            }).join(current_index_returns, how='inner').dropna()
+
+            if aligned_data.shape[0] < len(current_factors):
+                if fund_code:
+                    print(f"[错误] {fund_code} {target_date} 第{iteration+1}轮: 观测数({aligned_data.shape[0]}) < 因子数({len(current_factors)})")
+                break
+
+            X = aligned_data.iloc[:, 1:].values
+            y = aligned_data['fund'].values
+            n_obs = X.shape[0]
+
+            # 生成时间权重
+            adjusted_weights = self._get_time_weights(n_obs)
+
+            # 求解WLS
+            intercept, coefficients = self._solve_qp_osqp(
+                X, y, adjusted_weights
+            )
+
+            if coefficients is None:
+                # 求解失败，使用等权兜底
+                if fund_code:
+                    print(f"[兜底] {fund_code} {target_date} 第{iteration+1}轮: OSQP求解失败，使用等权")
+                equal_weight = (self.min_lev + self.max_lev) / 2 / len(current_factors)
+                final_params = np.full(len(current_factors), equal_weight)
+                return dict(zip(current_factors, final_params))
+
+            # 打印当前回归结果
+            sum_beta = np.sum(coefficients)
+            coef_dict = dict(zip(current_factors, coefficients))
+
+            if fund_code:
+                coef_str = ", ".join([f"{k}={v:.3f}" for k, v in coef_dict.items()])
+                print(f"[回归] {fund_code} {target_date} 第{iteration+1}轮: Σβ={sum_beta:.4f}, [{coef_str}]")
+
+            # 检测边界状态
+            boundary_status = self._detect_boundary_status(
+                coefficients, self.min_lev, self.max_lev
+            )
+
+            if boundary_status == 'interior':
+                # 解在内部，直接返回
+                if fund_code:
+                    print(f"[完成] {fund_code} {target_date} 解在边界内部，迭代结束")
+                return dict(zip(current_factors, coefficients))
+
+            # 在边界上，需要调整因子池
+            if fund_code:
+                print(f"[边界] {fund_code} {target_date} 第{iteration+1}轮: 检测到{boundary_status}边界，开始调整因子池")
+
+            new_factors, should_continue, p_values = self._expand_factor_pool(
+                fund_returns.loc[aligned_data.index],
+                current_index_returns,
+                coefficients,
+                boundary_status,
+                all_candidate_codes,
+                target_date
+            )
+
+            # 打印因子调整详情
+            removed = set(current_factors) - set(new_factors)
+            added = set(new_factors) - set(current_factors)
+
+            if fund_code:
+                # 打印P值信息
+                pval_str = ", ".join([f"{current_factors[i]}={v:.3f}" for i, v in p_values.items()])
+                print(f"[P值] {fund_code} {target_date} 第{iteration+1}轮: [{pval_str}]")
+                print(f"[调整] {fund_code} {target_date} 第{iteration+1}轮: 移除{removed}, 添加{added}, 因子数{len(current_factors)}→{len(new_factors)}")
+
+            if not should_continue:
+                # 无法继续调整，返回当前解
+                if fund_code:
+                    print(f"[终止] {fund_code} {target_date} 因子池只剩{len(current_factors)}个，迭代结束")
+                return dict(zip(current_factors, coefficients))
+
+            # 更新因子池，继续迭代
+            current_factors = new_factors
+
+        # 达到最大迭代次数
+        if fund_code:
+            print(f"[警告] {fund_code} {target_date} 达到最大迭代次数({max_iterations})")
+        return dict(zip(current_factors, coefficients))
+
+    def _constrained_wls(self, fund_returns, index_returns, time_weights,
+                        target_date=None, fund_code=None):
         """
         带约束的加权最小二乘法（使用OSQP求解器）
+        当解在边界上时动态调整因子池
+
+        混合策略：
+        1. 添加因子：用残差分析（久期方向兜底）
+        2. 移除因子：用P值，移除P值最大的
 
         参数:
             fund_returns: 基金收益率Series
             index_returns: 指数收益率DataFrame
             time_weights: 时间权重（已废弃，保留参数以兼容）
+            target_date: 目标日期
+            fund_code: 基金代码
 
         返回:
             dict: 回归系数
         """
-        # 对齐数据
-        aligned_data = pd.DataFrame({
-            'fund': fund_returns
-        }).join(index_returns, how='inner').dropna()
-
-        if aligned_data.shape[0] < len(index_returns.columns):
-            return None
-
-        X = aligned_data.iloc[:, 1:].values
-        y = aligned_data['fund'].values
-
-        n_factors = X.shape[1]
-        n_obs = X.shape[0]
-
-        # 根据对齐后的数据长度生成时间权重
-        adjusted_weights = self._get_time_weights(n_obs)
-
-        # 使用OSQP求解
-        intercept, coefficients = self._solve_qp_osqp(X, y, adjusted_weights)
-
-        if coefficients is None:
-            # OSQP求解失败，使用等权作为后备
-            equal_weight = (self.min_lev + self.max_lev) / 2 / n_factors
-            final_params = np.full(n_factors, equal_weight)
-        else:
-            final_params = coefficients
-
-        return dict(zip(index_returns.columns, final_params))
+        return self._iterative_constrained_wls(
+            fund_returns, index_returns, target_date, fund_code
+        )
 
     def _anchor_factor_by_duration(self, selected_factors, all_index_codes,
                                    reported_duration, target_date, fund_code=None):
@@ -342,7 +728,10 @@ class DurationModel:
         time_weights = self._get_time_weights(len(fund_returns))
 
         # 带约束的WLS
-        coefficients = self._constrained_wls(fund_returns, index_returns_selected, time_weights)
+        coefficients = self._constrained_wls(
+            fund_returns, index_returns_selected, time_weights,
+            target_date=target_date, fund_code=fund_code
+        )
 
         if coefficients is None:
             return None
@@ -363,9 +752,11 @@ class DurationModel:
             return None
 
         # 调整杠杆后的久期
-        duration = total_duration / total_weight
+        # duration = total_duration / total_weight
 
-        return duration
+        # return duration
+
+        return total_duration  # 直接返回加权久期，不除以总权重，因为总权重可能不为1，且我们希望反映实际杠杆水平
 
 
 class FundDurationCalculator:

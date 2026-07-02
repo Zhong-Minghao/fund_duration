@@ -150,9 +150,14 @@ class BondIndexDataProcessor:
         if self.price_df is None:
             self.load_price_data()
 
+        # 过滤出实际存在的列
+        valid_codes = [code for code in index_codes if code in self.price_df.columns]
+        if not valid_codes:
+            return pd.DataFrame()
+
         # 筛选日期范围
         mask = (self.price_df.index >= start_date) & (self.price_df.index <= end_date)
-        df = self.price_df.loc[mask, index_codes]
+        df = self.price_df.loc[mask, valid_codes]
 
         return df
 
@@ -171,9 +176,14 @@ class BondIndexDataProcessor:
         if self.duration_df is None:
             self.load_duration_data()
 
+        # 过滤出实际存在的列
+        valid_codes = [code for code in index_codes if code in self.duration_df.columns]
+        if not valid_codes:
+            return pd.DataFrame()
+
         # 筛选日期范围
         mask = (self.duration_df.index >= start_date) & (self.duration_df.index <= end_date)
-        df = self.duration_df.loc[mask, index_codes]
+        df = self.duration_df.loc[mask, valid_codes]
 
         return df
 
@@ -190,6 +200,10 @@ class BondIndexDataProcessor:
         """
         if self.duration_df is None:
             self.load_duration_data()
+
+        # 检查代码是否存在
+        if index_code not in self.duration_df.columns:
+            return None
 
         # 获取目标日期之前的所有久期数据
         mask = self.duration_df.index <= target_date

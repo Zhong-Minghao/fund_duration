@@ -20,8 +20,8 @@ class DurationModel:
                  index_processor,
                  window=15,
                  lasso_alpha=0.1,
-                 min_lev=0.8,
-                 max_lev=1.4,
+                 min_lev=0.6,
+                 max_lev=1.8,
                  outlier_threshold=2.5):
         """
         初始化
@@ -435,8 +435,8 @@ class DurationModel:
         return best_new_factors, best_remove, best_add
 
     def _iterative_constrained_wls(self, fund_returns, index_returns,
-                                  target_date=None, fund_code=None, max_iterations=10,
-                                  all_index_codes=None):
+                                  target_date=None, selected_factors_codes=None, fund_code=None,
+                                  max_iterations=10):
         """
         迭代带约束的WLS，当解在边界上时通过 swap-and-evaluate 调整因子池。
 
@@ -449,17 +449,16 @@ class DurationModel:
             fund_returns: 基金收益率Series
             index_returns: 指数收益率DataFrame（Lasso 选出的初始池）
             target_date: 目标日期
-            fund_code: 基金代码（用于日志）
+            selected_factors_codes: 选中的因子代码列表
             max_iterations: 最大迭代次数
-            all_index_codes: 完整候选指数代码列表（含 Lasso 未选的因子）；
-                             为 None 时回退到 index_returns.columns
 
         返回:
             dict: {factor_code: coefficient}
         """
-        current_factors = index_returns.columns.tolist()
+
+        current_factors = selected_factors_codes
         # 边界 swap 候选池：优先用完整指数集（含 Lasso 未选的因子）
-        all_candidate_codes = list(all_index_codes) if all_index_codes is not None \
+        all_candidate_codes = index_returns.columns.tolist() if index_returns.columns.tolist() is not None \
             else current_factors.copy()
 
         # 初始化结构化日志
@@ -501,8 +500,13 @@ class DurationModel:
                     self.iteration_logs[fund_code] = log
                 break
 
-            X = aligned_data.iloc[:, 1:].values
-            y = aligned_data['fund'].values
+            # 剔除回归离群点：(y, x1, x2, ...) 联合关系偏离的数据点
+            fund_returns_cleaned, index_returns_cleaned = self._remove_regression_outliers(
+                aligned_data['fund'], aligned_data.iloc[:, 1:]
+            )
+
+            X = index_returns_cleaned.values
+            y = fund_returns_cleaned.values
             n_obs = X.shape[0]
 
             # 生成时间权重
@@ -620,8 +624,8 @@ class DurationModel:
         else:
             return {}
 
-    def _constrained_wls(self, fund_returns, index_returns, time_weights,
-                        target_date=None, fund_code=None, all_index_codes=None):
+    def _constrained_wls(self, fund_returns, index_returns,
+                        target_date=None, selected_factors_codes=None, fund_code=None):
         """
         带约束的加权最小二乘法（使用OSQP求解器）
         当解在边界上时通过 swap-and-evaluate 动态调整因子池
@@ -631,15 +635,17 @@ class DurationModel:
             index_returns: 指数收益率DataFrame（Lasso 选出的初始池）
             time_weights: 时间权重（已废弃，保留参数以兼容）
             target_date: 目标日期
-            fund_code: 基金代码
-            all_index_codes: 完整候选指数代码列表（含 Lasso 未选的因子）
+            selected_factors_code: 选中的因子代码列表
 
         返回:
             dict: 回归系数
         """
+
+        # 生成时间权重
+        # time_weights = self._get_time_weights(len(fund_returns))
+
         return self._iterative_constrained_wls(
-            fund_returns, index_returns, target_date, fund_code,
-            all_index_codes=all_index_codes
+            fund_returns, index_returns, target_date, selected_factors_codes, fund_code=fund_code
         )
 
     def _anchor_factor_by_duration(self, selected_factors, all_index_codes,
@@ -734,21 +740,12 @@ class DurationModel:
                 fund_code=fund_code
             )
 
-        index_returns_selected = index_returns[selected_factors]
-
-        # 剔除回归离群点：(y, x1, x2, ...) 联合关系偏离的数据点
-        fund_returns, index_returns_selected = self._remove_regression_outliers(
-            fund_returns, index_returns_selected
-        )
-
-        # 生成时间权重
-        time_weights = self._get_time_weights(len(fund_returns))
+        # index_returns_selected = index_returns[selected_factors]
 
         # 带约束的WLS
         coefficients = self._constrained_wls(
-            fund_returns, index_returns_selected, time_weights,
-            target_date=target_date, fund_code=fund_code,
-            all_index_codes=index_returns.columns.tolist()
+            fund_returns, index_returns,
+            target_date=target_date, selected_factors_codes=selected_factors, fund_code=fund_code
         )
 
         if coefficients is None:

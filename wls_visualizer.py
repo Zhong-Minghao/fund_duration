@@ -202,6 +202,9 @@ class WLSVisualizer:
             if idx_dur is not None and not np.isnan(idx_dur):
                 total_duration += final_coefs.get(f, 0) * idx_dur
 
+        # 10. 计算离群点mask（复用_remove_regression_outliers的逻辑）
+        outlier_mask = self._compute_outlier_mask(fund_returns, final_factor_returns)
+
         return {
             'fund_code': fund_code,
             'fund_returns': fund_returns,
@@ -213,7 +216,8 @@ class WLSVisualizer:
             'residuals': residuals,
             'r_squared': r_squared,
             'calculated_duration': total_duration,
-            'reported_duration': reported_duration
+            'reported_duration': reported_duration,
+            'outlier_mask': outlier_mask  # 新增：离群点mask
         }
 
     def plot_main_panel(self, fund_code, fund_name, data,
@@ -262,6 +266,10 @@ class WLSVisualizer:
         # 定义颜色列表（用于各指数）
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
 
+        # 获取离群点mask
+        outlier_mask = data.get('outlier_mask', np.array([False] * len(dates)))
+        normal_mask = ~outlier_mask
+
         # 绘制各指数收益率（细线）
         for i, factor in enumerate(final_factors):
             if factor in index_returns.columns:
@@ -270,21 +278,35 @@ class WLSVisualizer:
                         label=f'{self._format_factor_name(factor)}',
                         markersize=3, linewidth=0.8, alpha=0.5, color=color)
 
-        # 绘制实际收益率和拟合收益率（粗线，突出显示）
-        ax1.plot(dates, fund_returns.values, 'o-', label='实际收益率',
-                markersize=4, linewidth=1.8, alpha=0.8, color='#2c3e50', zorder=10)
-        ax1.plot(dates, fitted_values.values, 's--', label='拟合收益率',
-                markersize=4, linewidth=1.8, alpha=0.8, color='#e74c3c', zorder=10)
+        # 正常点：彩色
+        ax1.plot(dates[normal_mask], fund_returns.values[normal_mask], 'o-',
+                label='实际收益率（正常）', markersize=4, linewidth=1.8,
+                alpha=0.8, color='#2c3e50', zorder=10)
+        ax1.plot(dates[normal_mask], fitted_values.values[normal_mask], 's--',
+                label='拟合收益率（正常）', markersize=4, linewidth=1.8,
+                alpha=0.8, color='#e74c3c', zorder=10)
 
-        # 用点的大小表示权重
+        # 离群点：灰色
+        if outlier_mask.any():
+            n_outliers = outlier_mask.sum()
+            ax1.plot(dates[outlier_mask], fund_returns.values[outlier_mask], 'o',
+                    label=f'离群点 ({n_outliers}个)',
+                    markersize=6, alpha=0.6, color='gray', markeredgecolor='darkgray',
+                    markeredgewidth=1, zorder=11)
+            ax1.plot(dates[outlier_mask], fitted_values.values[outlier_mask], 's',
+                    markersize=6, alpha=0.6, color='gray', markeredgecolor='darkgray',
+                    markeredgewidth=1, zorder=11)
+
+            # 用点的大小表示权重（仅对正常点）
         normalized_weights = (weights - weights.min()) / (weights.max() - weights.min() + 1e-10)
         for i, (date, w) in enumerate(zip(dates, normalized_weights)):
-            ax1.scatter(date, fund_returns.values[i], s=20 + w*80, alpha=0.3, color='#2c3e50', zorder=5)
-            ax1.scatter(date, fitted_values.values[i], s=20 + w*80, alpha=0.3, color='#e74c3c', zorder=5)
+            if normal_mask.iloc[i] if hasattr(normal_mask, 'iloc') else normal_mask[i]:
+                ax1.scatter(date, fund_returns.values[i], s=20 + w*80, alpha=0.3, color='#2c3e50', zorder=5)
+                ax1.scatter(date, fitted_values.values[i], s=20 + w*80, alpha=0.3, color='#e74c3c', zorder=5)
 
         ax1.set_xlabel('日期', fontsize=10)
         ax1.set_ylabel('收益率', fontsize=10)
-        ax1.set_title('收益率时间序列（基金 vs 指数 vs 拟合）', fontsize=11, fontweight='bold')
+        ax1.set_title('收益率时间序列（基金 vs 指数 vs 拟合，灰色=离群点）', fontsize=11, fontweight='bold')
         ax1.legend(fontsize=7, loc='upper left', bbox_to_anchor=(1, 1))
         ax1.grid(alpha=0.3)
         ax1.tick_params(axis='x', rotation=45)
@@ -343,12 +365,22 @@ class WLSVisualizer:
 
         # 子图4：残差时间序列图
         ax4 = fig.add_subplot(gs[1, 1])
-        ax4.plot(dates, residuals.values, 'o-', label='残差',
-                markersize=4, linewidth=1, alpha=0.7, color='#9b59b6')
 
-        # 点的大小表示权重
+        # 正常点：彩色
+        ax4.plot(dates[normal_mask], residuals.values[normal_mask], 'o-',
+                label='残差（正常）', markersize=4, linewidth=1,
+                alpha=0.7, color='#9b59b6', zorder=5)
+
+        # 离群点：灰色
+        if outlier_mask.any():
+            ax4.plot(dates[outlier_mask], residuals.values[outlier_mask], 'o',
+                    label='离群点', markersize=6, alpha=0.6, color='gray',
+                    markeredgecolor='darkgray', markeredgewidth=1, zorder=10)
+
+        # 用点的大小表示权重（仅对正常点）
         for i, (date, w) in enumerate(zip(dates, normalized_weights)):
-            ax4.scatter(date, residuals.values[i], s=20 + w*80, alpha=0.4, color='#9b59b6')
+            if normal_mask.iloc[i] if hasattr(normal_mask, 'iloc') else normal_mask[i]:
+                ax4.scatter(date, residuals.values[i], s=20 + w*80, alpha=0.4, color='#9b59b6')
 
         ax4.axhline(0, color='gray', linestyle='--', alpha=0.5)
         ax4.axhline(mu, color='red', linestyle='-', linewidth=1, alpha=0.7)
@@ -357,7 +389,7 @@ class WLSVisualizer:
 
         ax4.set_xlabel('日期', fontsize=10)
         ax4.set_ylabel('残差', fontsize=10)
-        ax4.set_title('残差时间序列', fontsize=11, fontweight='bold')
+        ax4.set_title('残差时间序列（灰色=离群点）', fontsize=11, fontweight='bold')
         ax4.legend(fontsize=9)
         ax4.grid(alpha=0.3)
         ax4.tick_params(axis='x', rotation=45)
@@ -431,6 +463,10 @@ class WLSVisualizer:
 
         normalized_weights = (weights - weights.min()) / (weights.max() - weights.min() + 1e-10)
 
+        # 获取离群点mask
+        outlier_mask = data.get('outlier_mask', np.array([False] * len(fund_returns)))
+        normal_mask = ~outlier_mask
+
         for i, factor in enumerate(final_factors):
             row = i // n_cols
             col = i % n_cols
@@ -438,14 +474,21 @@ class WLSVisualizer:
 
             factor_returns = index_returns[factor].values
 
-            # 散点图，点大小表示权重
-            scatter = ax.scatter(factor_returns, fund_returns.values,
-                               s=20 + normalized_weights * 80,
-                               alpha=0.5, c=normalized_weights,
-                               cmap='viridis', edgecolors='none')
+            # 正常点：彩色渐变（viridis）
+            scatter = ax.scatter(factor_returns[normal_mask], fund_returns.values[normal_mask],
+                               s=20 + normalized_weights[normal_mask] * 80,
+                               alpha=0.6, c=normalized_weights[normal_mask],
+                               cmap='viridis', linewidths=0, zorder=5)
 
-            # 计算回归线
-            mask = ~np.isnan(factor_returns) & ~np.isnan(fund_returns.values)
+            # 离群点：灰色
+            if outlier_mask.any():
+                ax.scatter(factor_returns[outlier_mask], fund_returns.values[outlier_mask],
+                          s=40, alpha=0.7, color='gray',
+                          edgecolors='darkgray', linewidths=1,
+                          label='离群点', zorder=10)
+
+            # 计算回归线（仅用正常点）
+            mask = normal_mask & ~np.isnan(factor_returns) & ~np.isnan(fund_returns.values)
             if mask.sum() > 2:
                 z = np.polyfit(factor_returns[mask], fund_returns.values[mask], 1)
                 p = np.poly1d(z)
@@ -468,6 +511,9 @@ class WLSVisualizer:
             ax.set_ylabel('基金收益率', fontsize=9)
             ax.set_title(f'R²={r2:.4f}', fontsize=10)
             ax.grid(alpha=0.3)
+            # 添加离群点图例（如果有离群点）
+            if outlier_mask.any():
+                ax.legend(fontsize=7)
 
         # 隐藏多余的子图
         for i in range(n_factors, n_rows * n_cols):
@@ -529,6 +575,34 @@ class WLSVisualizer:
         """格式化指数代码为可读名称"""
         # 简化显示，去掉后缀（如.CS），保留代码部分
         return str(factor_code).split('.')[0]
+
+    def _compute_outlier_mask(self, fund_returns, index_returns):
+        """
+        计算离群点mask（复用_remove_regression_outliers的逻辑）
+
+        参数:
+            fund_returns: Series, 基金收益率
+            index_returns: DataFrame, 指数收益率
+
+        返回:
+            array: 布尔数组，True表示离群点
+        """
+        y = fund_returns.values
+        X = np.column_stack([np.ones(len(y)), index_returns.values])
+
+        try:
+            beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+            residuals = y - X @ beta
+            sigma = residuals.std()
+
+            if sigma < 1e-10:
+                return np.array([False] * len(y))
+
+            std_resid = residuals / sigma
+            # outlier_threshold默认2.5
+            return np.abs(std_resid) > self.duration_model.outlier_threshold
+        except Exception:
+            return np.array([False] * len(y))
 
 
 if __name__ == '__main__':

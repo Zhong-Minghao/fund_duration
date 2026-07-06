@@ -46,19 +46,32 @@ class DurationModel:
         """更新index_processor引用"""
         self.index_processor = index_processor
 
-    def _get_time_weights(self, n):
+    def _get_time_weights(self, n, method='linear'):
         """
         生成时间权重（较近的数据权重更高）
 
         参数:
         n: 观测点数量
+        method: 权重生成方法 ('linear', 'exponential', 'uniform')
 
         返回:
         array: 权重数组，最新数据权重为1
         """
-        # 线性递增权重，归一化使最新数据权重为1
-        weights = np.arange(1, n + 1)
-        return weights / n  # 等价于 weights / weights.max()
+        if method == 'exponential':
+            # 指数递减权重，归一化使最新数据权重为1
+            decay_rate = 0.1  # 可调节衰减率
+            weights = np.exp(-decay_rate * np.arange(n)[::-1])
+            return weights / weights.max()
+        elif method == 'linear':
+            # 线性递增权重，归一化使最新数据权重为1
+            weights = np.arange(1, n + 1)
+            return weights / n  # 等价于 weights / weights.max()
+        elif method == 'uniform':
+            # 均匀权重
+            weights = np.ones(n)
+            return weights
+        else:
+            raise ValueError("Unsupported weight method. Choose from 'linear', 'exponential', or 'uniform'.")
 
     def _lasso_select_factors(self, fund_returns, index_returns):
         """
@@ -405,7 +418,7 @@ class DurationModel:
 
                 X = aligned.iloc[:, 1:].values
                 y = aligned['fund'].values
-                w = self._get_time_weights(len(y))
+                w = self._get_time_weights(len(y), method='uniform')
 
                 _, coefs = self._solve_qp_osqp(X, y, w)
                 if coefs is None:
@@ -436,7 +449,7 @@ class DurationModel:
 
     def _iterative_constrained_wls(self, fund_returns, index_returns,
                                   target_date=None, selected_factors_codes=None, fund_code=None,
-                                  max_iterations=10):
+                                  max_iterations=10, method='uniform'):
         """
         迭代带约束的WLS，当解在边界上时通过 swap-and-evaluate 调整因子池。
 
@@ -451,7 +464,7 @@ class DurationModel:
             target_date: 目标日期
             selected_factors_codes: 选中的因子代码列表
             max_iterations: 最大迭代次数
-
+            method: 时间权重生成方法
         返回:
             dict: {factor_code: coefficient}
         """
@@ -510,7 +523,7 @@ class DurationModel:
             n_obs = X.shape[0]
 
             # 生成时间权重
-            adjusted_weights = self._get_time_weights(n_obs)
+            adjusted_weights = self._get_time_weights(n_obs, method='uniform')
 
             # 求解WLS
             intercept, coefficients = self._solve_qp_osqp(
@@ -625,7 +638,7 @@ class DurationModel:
             return {}
 
     def _constrained_wls(self, fund_returns, index_returns,
-                        target_date=None, selected_factors_codes=None, fund_code=None):
+                        target_date=None, selected_factors_codes=None, fund_code=None, method='uniform'):
         """
         带约束的加权最小二乘法（使用OSQP求解器）
         当解在边界上时通过 swap-and-evaluate 动态调整因子池
@@ -645,7 +658,7 @@ class DurationModel:
         # time_weights = self._get_time_weights(len(fund_returns))
 
         return self._iterative_constrained_wls(
-            fund_returns, index_returns, target_date, selected_factors_codes, fund_code=fund_code
+            fund_returns, index_returns, target_date, selected_factors_codes, fund_code=fund_code, method=method
         )
 
     def _anchor_factor_by_duration(self, selected_factors, all_index_codes,
@@ -685,7 +698,7 @@ class DurationModel:
             return selected_factors
 
     def calculate_fund_duration(self, fund_nav_df, index_codes, target_date,
-                                reported_duration=None, fund_code=None):
+                                reported_duration=None, fund_code=None, method='uniform'):
         """
         计算单只基金在目标日期的久期
 
@@ -745,7 +758,7 @@ class DurationModel:
         # 带约束的WLS
         coefficients = self._constrained_wls(
             fund_returns, index_returns,
-            target_date=target_date, selected_factors_codes=selected_factors, fund_code=fund_code
+            target_date=target_date, selected_factors_codes=selected_factors, fund_code=fund_code, method=method
         )
 
         if coefficients is None:
@@ -799,12 +812,13 @@ class FundDurationCalculator:
         # 创建久期模型
         self.duration_model = DurationModel(index_processor)
 
-    def calculate_fund_pool_duration(self, target_date):
+    def calculate_fund_pool_duration(self, target_date, method='uniform'):
         """
         计算基金池中所有基金的久期
 
         参数:
         target_date: 目标日期 'YYYY-MM-DD'
+        method: 时间权重生成方法
 
         返回:
         dict: {fund_code: duration}
@@ -852,7 +866,8 @@ class FundDurationCalculator:
                     duration = self.duration_model.calculate_fund_duration(
                         fund_nav_df, index_codes, target_date,
                         reported_duration=reported_duration,
-                        fund_code=fund_code
+                        fund_code=fund_code,
+                        method=method
                     )
 
                     if duration is not None:
@@ -895,7 +910,8 @@ class FundDurationCalculator:
                     duration = self.duration_model.calculate_fund_duration(
                         fund_nav_df, index_codes, target_date,
                         reported_duration=reported_duration,
-                        fund_code=fund_code
+                        fund_code=fund_code,
+                        method=method
                     )
 
                     if duration is not None:
@@ -907,48 +923,48 @@ class FundDurationCalculator:
 
         return results
 
-    def calculate_duration_statistics(self, target_date):
-        """
-        计算久期统计数据（中位数和分歧度）
+    # def calculate_duration_statistics(self, target_date):
+    #     """
+    #     计算久期统计数据（中位数和分歧度）
 
-        参数:
-        target_date: 目标日期 'YYYY-MM-DD'
+    #     参数:
+    #     target_date: 目标日期 'YYYY-MM-DD'
 
-        返回:
-        dict: 久期统计数据
-        """
-        results = self.calculate_fund_pool_duration(target_date)
+    #     返回:
+    #     dict: 久期统计数据
+    #     """
+    #     results = self.calculate_fund_pool_duration(target_date)
 
-        if not results:
-            return None
+    #     if not results:
+    #         return None
 
-        # 转换为DataFrame
-        df = pd.DataFrame.from_dict(results, orient='index')
+    #     # 转换为DataFrame
+    #     df = pd.DataFrame.from_dict(results, orient='index')
 
-        # 分类统计
-        stats = {}
+    #     # 分类统计
+    #     stats = {}
 
-        for fund_type in ['short', 'medium_long']:
-            for bond_type in ['rate', 'credit']:
-                key = f'{fund_type}_{bond_type}'
+    #     for fund_type in ['short', 'medium_long']:
+    #         for bond_type in ['rate', 'credit']:
+    #             key = f'{fund_type}_{bond_type}'
 
-                mask = (df['fund_type'] == fund_type) & (df['bond_type'] == bond_type)
-                subset = df[mask]
+    #             mask = (df['fund_type'] == fund_type) & (df['bond_type'] == bond_type)
+    #             subset = df[mask]
 
-                if len(subset) > 0:
-                    durations = subset['duration'].values
+    #             if len(subset) > 0:
+    #                 durations = subset['duration'].values
 
-                    stats[key] = {
-                        'count': len(durations),
-                        'median': np.median(durations),
-                        'mean': np.mean(durations),
-                        'std': np.std(durations),
-                        'cv': np.std(durations) / np.mean(durations) if np.mean(durations) > 0 else np.nan,
-                        'min': np.min(durations),
-                        'max': np.max(durations)
-                    }
+    #                 stats[key] = {
+    #                     'count': len(durations),
+    #                     'median': np.median(durations),
+    #                     'mean': np.mean(durations),
+    #                     'std': np.std(durations),
+    #                     'cv': np.std(durations) / np.mean(durations) if np.mean(durations) > 0 else np.nan,
+    #                     'min': np.min(durations),
+    #                     'max': np.max(durations)
+    #                 }
 
-        return stats
+    #     return stats
 
     def export_iteration_logs(self, target_date, results_dict=None, output_path=None):
         """

@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from WindPy import w
 import sys
 
+from util import smooth_series
+
 # 设置UTF-8编码输出（兼容notebook环境）
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -97,7 +99,7 @@ class WindDataFetcher:
             return None
 
         # 计算移动平均
-        df['NAV_smooth'] = df['NAV'].rolling(window=window, min_periods=1).mean()
+        df['NAV_smooth'] = smooth_series(df['NAV'], window=window)
 
         # 计算日度收益率
         df['return'] = df['NAV_smooth'].pct_change()

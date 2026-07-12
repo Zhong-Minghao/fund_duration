@@ -8,6 +8,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import sys
 
+from util import smooth_series
+
 # 设置UTF-8编码输出（兼容notebook环境）
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -160,6 +162,24 @@ class BondIndexDataProcessor:
         df = self.price_df.loc[mask, valid_codes]
 
         return df
+
+    def get_index_prices_smoothed(self, index_codes, start_date, end_date, window=5):
+        """
+        获取平滑后的指数价格数据（滚动均值），与基金侧平滑口径保持一致
+
+        参数:
+        index_codes: 指数代码列表
+        start_date: 开始日期 'YYYY-MM-DD'
+        end_date: 结束日期 'YYYY-MM-DD'
+        window: 平滑窗口，默认5（与WindDataFetcher.get_fund_nav_smoothed的默认一致）
+
+        返回:
+        DataFrame: 平滑后的指数价格数据
+        """
+        df = self.get_index_prices(index_codes, start_date, end_date)
+        if df.empty:
+            return df
+        return smooth_series(df, window=window)
 
     def get_index_durations(self, index_codes, start_date, end_date):
         """

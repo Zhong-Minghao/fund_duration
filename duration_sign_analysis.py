@@ -138,10 +138,11 @@ class SignBasedDurationAnalyzer:
             return None, None, len(fund_returns)
 
         # 获取指数收益率
-        index_prices = self.index_processor.get_index_prices(
+        index_prices = self.index_processor.get_index_prices_smoothed(
             index_codes,
             start_date.strftime('%Y-%m-%d'),
-            end_date.strftime('%Y-%m-%d')
+            end_date.strftime('%Y-%m-%d'),
+            window=self.duration_model.index_smooth_window
         )
 
         if index_prices.empty:
@@ -248,10 +249,11 @@ class SignBasedDurationAnalyzer:
         fund_returns_ext = fund_returns_ext.iloc[-extended_window:]
 
         # 获取指数收益率
-        index_prices = self.index_processor.get_index_prices(
+        index_prices = self.index_processor.get_index_prices_smoothed(
             index_codes,
             fund_returns_ext.index[0].strftime('%Y-%m-%d'),
-            fund_returns_ext.index[-1].strftime('%Y-%m-%d')
+            fund_returns_ext.index[-1].strftime('%Y-%m-%d'),
+            window=self.duration_model.index_smooth_window
         )
 
         if index_prices.empty:

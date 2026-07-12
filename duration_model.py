@@ -20,9 +20,10 @@ class DurationModel:
                  index_processor,
                  window=15,
                  lasso_alpha=0.1,
-                 min_lev=0.6,
-                 max_lev=1.8,
-                 outlier_threshold=2.5):
+                 min_lev=0.8,
+                 max_lev=1.4,
+                 outlier_threshold=2.5,
+                 index_smooth_window=5):
         """
         初始化
 
@@ -33,6 +34,7 @@ class DurationModel:
         min_lev: 最小杠杆率
         max_lev: 最大杠杆率
         outlier_threshold: OLS残差标准化阈值，超过此值的数据点整行剔除（默认2.5）
+        index_smooth_window: 指数价格平滑窗口，与基金侧平滑口径保持一致（默认5）
         """
         self.index_processor = index_processor
         self.window = window
@@ -40,6 +42,7 @@ class DurationModel:
         self.min_lev = min_lev
         self.max_lev = max_lev
         self.outlier_threshold = outlier_threshold
+        self.index_smooth_window = index_smooth_window
         self.iteration_logs = {}  # {fund_code: log_dict}，记录每只基金的迭代过程
 
     def update_index_processor(self, index_processor):
@@ -395,17 +398,12 @@ class DurationModel:
             if not valid_removals:
                 continue
 
-            # 获取 F_new 的价格数据
-            prices_new = self.index_processor.get_index_prices([F_new], start_date, end_date)
-            if prices_new.empty:
-                continue
-
             for F_remove in valid_removals:
                 trial_factors = [f for f in current_factors if f != F_remove] + [F_new]
 
                 # 获取试验因子池收益率
-                trial_prices = self.index_processor.get_index_prices(
-                    trial_factors, start_date, end_date)
+                trial_prices = self.index_processor.get_index_prices_smoothed(
+                    trial_factors, start_date, end_date, window=self.index_smooth_window)
                 if trial_prices.empty:
                     continue
                 trial_returns = trial_prices.pct_change()
@@ -487,8 +485,8 @@ class DurationModel:
             'iterations': []
         }
 
-        if fund_code:
-            print(f"[开始] {fund_code} {target_date} 初始因子池({len(current_factors)}个): {current_factors}")
+        # if fund_code:
+        #     print(f"[开始] {fund_code} {target_date} 初始因子池({len(current_factors)}个): {current_factors}")
 
         coefficients = None  # 防止 data_error break 后引用未定义变量
         coef_dict = {}
@@ -503,8 +501,8 @@ class DurationModel:
             }).join(current_index_returns, how='inner').dropna()
 
             if aligned_data.shape[0] < len(current_factors):
-                if fund_code:
-                    print(f"[错误] {fund_code} {target_date} 第{iteration+1}轮: 观测数({aligned_data.shape[0]}) < 因子数({len(current_factors)})")
+                # if fund_code:
+                #     print(f"[错误] {fund_code} {target_date} 第{iteration+1}轮: 观测数({aligned_data.shape[0]}) < 因子数({len(current_factors)})")
                 log['total_iterations'] = iteration + 1
                 log['convergence'] = 'data_error'
                 log['final_factors'] = current_factors.copy()
@@ -532,8 +530,8 @@ class DurationModel:
 
             if coefficients is None:
                 # 求解失败，使用等权兜底
-                if fund_code:
-                    print(f"[兜底] {fund_code} {target_date} 第{iteration+1}轮: OSQP求解失败，使用等权")
+                # if fund_code:
+                #     print(f"[兜底] {fund_code} {target_date} 第{iteration+1}轮: OSQP求解失败，使用等权")
                 equal_weight = (self.min_lev + self.max_lev) / 2 / len(current_factors)
                 final_params = np.full(len(current_factors), equal_weight)
                 log['total_iterations'] = iteration + 1
@@ -548,9 +546,9 @@ class DurationModel:
             sum_beta = np.sum(coefficients)
             coef_dict = dict(zip(current_factors, coefficients))
 
-            if fund_code:
-                coef_str = ", ".join([f"{k}={v:.3f}" for k, v in coef_dict.items()])
-                print(f"[回归] {fund_code} {target_date} 第{iteration+1}轮: Σβ={sum_beta:.4f}, [{coef_str}]")
+            # if fund_code:
+            #     coef_str = ", ".join([f"{k}={v:.3f}" for k, v in coef_dict.items()])
+            #     print(f"[回归] {fund_code} {target_date} 第{iteration+1}轮: Σβ={sum_beta:.4f}, [{coef_str}]")
 
             # 检测边界状态
             boundary_status = self._detect_boundary_status(
@@ -571,8 +569,8 @@ class DurationModel:
 
             if boundary_status == 'interior':
                 # 解在内部，直接返回
-                if fund_code:
-                    print(f"[完成] {fund_code} {target_date} 解在边界内部，迭代结束")
+                # if fund_code:
+                #     print(f"[完成] {fund_code} {target_date} 解在边界内部，迭代结束")
                 log['iterations'].append(iter_log)
                 log['total_iterations'] = iteration + 1
                 log['convergence'] = 'interior'
@@ -584,9 +582,9 @@ class DurationModel:
 
             # 在边界上，搜索最优 swap
             log['triggered'] = True
-            if fund_code:
-                print(f"[边界] {fund_code} {target_date} 第{iteration+1}轮: "
-                      f"检测到{boundary_status}边界，Σβ={sum_beta:.4f}，搜索最优swap")
+            # if fund_code:
+            #     print(f"[边界] {fund_code} {target_date} 第{iteration+1}轮: "
+            #           f"检测到{boundary_status}边界，Σβ={sum_beta:.4f}，搜索最优swap")
 
             new_factors, F_remove, F_add = self._find_best_swap(
                 fund_returns.loc[aligned_data.index],
@@ -601,10 +599,10 @@ class DurationModel:
             iter_log['factor_removed'] = F_remove
             iter_log['factor_added']   = F_add
 
-            if fund_code and F_remove is not None:
-                print(f"[调整] {fund_code} {target_date} 第{iteration+1}轮: "
-                      f"移除{{{F_remove}}}, 添加{{{F_add}}}, "
-                      f"因子数{len(current_factors)}→{len(new_factors)}")
+            # if fund_code and F_remove is not None:
+            #     print(f"[调整] {fund_code} {target_date} 第{iteration+1}轮: "
+            #           f"移除{{{F_remove}}}, 添加{{{F_add}}}, "
+            #           f"因子数{len(current_factors)}→{len(new_factors)}")
 
             log['iterations'].append(iter_log)
 
@@ -623,8 +621,8 @@ class DurationModel:
 
         # 达到最大迭代次数（data_error break 时 log['convergence'] 已设置）
         if log['convergence'] != 'data_error':
-            if fund_code:
-                print(f"[警告] {fund_code} {target_date} 达到最大迭代次数({max_iterations})")
+            # if fund_code:
+            #     print(f"[警告] {fund_code} {target_date} 达到最大迭代次数({max_iterations})")
             log['total_iterations'] = max_iterations
             log['convergence'] = 'max_iter'
             log['final_factors'] = current_factors.copy()
@@ -694,7 +692,8 @@ class DurationModel:
         if best_code not in selected_factors:
             return selected_factors + [best_code]
         else:
-            print(f"[警告] {fund_code} {target_date} 回归自变量只有1个指数 {best_code}，且该指数已是最近久期匹配，无额外因子可补充")
+            # if fund_code:
+            #     print(f"[警告] {fund_code} {target_date} 回归自变量只有1个指数 {best_code}，且该指数已是最近久期匹配，无额外因子可补充")
             return selected_factors
 
     def calculate_fund_duration(self, fund_nav_df, index_codes, target_date,
@@ -724,10 +723,11 @@ class DurationModel:
         fund_returns = fund_returns.iloc[-self.window:]
 
         # 获取指数收益率
-        index_prices = self.index_processor.get_index_prices(
+        index_prices = self.index_processor.get_index_prices_smoothed(
             index_codes,
             start_date.strftime('%Y-%m-%d'),
-            end_date.strftime('%Y-%m-%d')
+            end_date.strftime('%Y-%m-%d'),
+            window=self.index_smooth_window
         )
 
         if index_prices.empty:

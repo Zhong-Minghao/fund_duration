@@ -158,10 +158,11 @@ class WLSVisualizer:
             return None
 
         # 3. 获取指数收益率
-        index_prices = self.index_processor.get_index_prices(
+        index_prices = self.index_processor.get_index_prices_smoothed(
             index_codes,
             start_date.strftime('%Y-%m-%d'),
-            end_date.strftime('%Y-%m-%d')
+            end_date.strftime('%Y-%m-%d'),
+            window=self.duration_model.index_smooth_window
         )
 
         if index_prices.empty:

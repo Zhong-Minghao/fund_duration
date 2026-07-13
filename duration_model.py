@@ -318,8 +318,8 @@ class DurationModel:
 
         return p_values
 
-    def _find_best_swap(self, fund_returns, current_factors, all_candidate_codes,
-                        boundary_type, target_date, fund_code=None):
+    def _find_best_swap(self, fund_returns, index_returns, current_factors,
+                        all_candidate_codes, boundary_type, target_date, fund_code=None, forbidden_swaps=None):
         """
         在久期方向约束下枚举所有合规 swap，返回 WLS 目标最小的方案。
 
@@ -331,15 +331,19 @@ class DurationModel:
 
         参数:
             fund_returns: 基金收益率Series（已对齐）
+            index_returns: 完整的指数收益率DataFrame（与主回归同一份数据）
             current_factors: 当前因子列表
             all_candidate_codes: 全部候选指数代码列表
             boundary_type: 'upper' 或 'lower'
             target_date: 目标日期
             fund_code: 基金代码（用于日志）
+            forbidden_swaps: 禁止的swap集合 Set[(remove_code, add_code)]
 
         返回:
             tuple: (new_factors, F_remove, F_new) 或 (None, None, None)
         """
+        if forbidden_swaps is None:
+            forbidden_swaps = set()
         # 1. 当前池久期（跳过久期数据缺失的因子）
         pool_durations = {}
         for f in current_factors:
@@ -373,9 +377,6 @@ class DurationModel:
             return None, None, None
 
         # 3. 枚举所有合规 (F_remove, F_new) 对，选 WLS 目标最小者
-        start_date = fund_returns.index[0].strftime('%Y-%m-%d')
-        end_date   = fund_returns.index[-1].strftime('%Y-%m-%d')
-
         best_Q          = float('inf')
         best_new_factors = None
         best_remove     = None
@@ -399,24 +400,36 @@ class DurationModel:
                 continue
 
             for F_remove in valid_removals:
+                # 禁止swap检查：跳过已尝试过的因子对
+                if forbidden_swaps and (F_remove, F_new) in forbidden_swaps:
+                    continue
+
                 trial_factors = [f for f in current_factors if f != F_remove] + [F_new]
 
-                # 获取试验因子池收益率
-                trial_prices = self.index_processor.get_index_prices_smoothed(
-                    trial_factors, start_date, end_date, window=self.index_smooth_window)
-                if trial_prices.empty:
+                # 从完整的index_returns中获取试验因子池收益率（确保数据一致性）
+                if not all(f in index_returns.columns for f in trial_factors):
                     continue
-                trial_returns = trial_prices.pct_change()
+                trial_returns = index_returns[trial_factors].copy()
 
-                # 对齐
+                # 对齐数据
                 aligned = pd.DataFrame({'fund': fund_returns}).join(
                     trial_returns, how='inner').dropna()
                 if aligned.shape[0] < len(trial_factors):
                     continue
 
-                X = aligned.iloc[:, 1:].values
-                y = aligned['fund'].values
-                w = self._get_time_weights(len(y), method='uniform')
+                # 添加离群点剔除（与主回归保持一致）
+                fund_clean, index_clean = self._remove_regression_outliers(
+                    aligned['fund'], aligned.iloc[:, 1:]
+                )
+
+                X = index_clean.values
+                y = fund_clean.values
+                n_obs = len(y)
+
+                if n_obs < len(trial_factors):
+                    continue
+
+                w = self._get_time_weights(n_obs, method='uniform')
 
                 _, coefs = self._solve_qp_osqp(X, y, w)
                 if coefs is None:
@@ -425,8 +438,10 @@ class DurationModel:
                 Q = float(np.sum(w * (y - X @ coefs) ** 2))
 
                 if fund_code:
+                    # 改进Q值输出格式：极小值用科学计数法
+                    q_str = f"{Q:.2e}" if Q < 1e-6 else f"{Q:.6f}"
                     print(f"  [评估] 移除{F_remove}(dur={pool_durations[F_remove]:.2f}Y)"
-                          f" → 添加{F_new}(dur={dur_new:.2f}Y): Q={Q:.6f}")
+                          f" → 添加{F_new}(dur={dur_new:.2f}Y): Q={q_str}, n={n_obs}")
 
                 if Q < best_Q:
                     best_Q           = Q
@@ -440,8 +455,9 @@ class DurationModel:
             return None, None, None
 
         if fund_code:
+            q_str = f"{best_Q:.2e}" if best_Q < 1e-6 else f"{best_Q:.6f}"
             print(f"[最优swap] {fund_code} {target_date}: "
-                  f"移除{best_remove} → 添加{best_add}, Q={best_Q:.6f}")
+                  f"移除{best_remove} → 添加{best_add}, Q={q_str}")
 
         return best_new_factors, best_remove, best_add
 
@@ -471,6 +487,10 @@ class DurationModel:
         # 边界 swap 候选池：优先用完整指数集（含 Lasso 未选的因子）
         all_candidate_codes = index_returns.columns.tolist() if index_returns.columns.tolist() is not None \
             else current_factors.copy()
+
+        # 初始化禁止swap集合（防止因子振荡）
+        forbidden_swaps = set()
+        current_round_swaps = []  # 记录本轮尝试的swap
 
         # 初始化结构化日志
         log = {
@@ -582,27 +602,33 @@ class DurationModel:
 
             # 在边界上，搜索最优 swap
             log['triggered'] = True
-            # if fund_code:
-            #     print(f"[边界] {fund_code} {target_date} 第{iteration+1}轮: "
-            #           f"检测到{boundary_status}边界，Σβ={sum_beta:.4f}，搜索最优swap")
+            if fund_code:
+                print(f"[边界] {fund_code} {target_date} 第{iteration+1}轮: "
+                      f"检测到{boundary_status}边界，Σβ={sum_beta:.4f}，搜索最优swap")
 
             new_factors, F_remove, F_add = self._find_best_swap(
                 fund_returns.loc[aligned_data.index],
+                index_returns,  # 传入完整的指数收益率数据
                 current_factors,
                 all_candidate_codes,
                 boundary_status,
                 target_date,
-                fund_code
+                fund_code,
+                forbidden_swaps  # 传入禁止集合
             )
+
+            # 记录本轮尝试的swap（无论是否成功）
+            if F_remove is not None:
+                current_round_swaps.append((F_remove, F_add))
 
             # 补充本轮日志
             iter_log['factor_removed'] = F_remove
             iter_log['factor_added']   = F_add
 
-            # if fund_code and F_remove is not None:
-            #     print(f"[调整] {fund_code} {target_date} 第{iteration+1}轮: "
-            #           f"移除{{{F_remove}}}, 添加{{{F_add}}}, "
-            #           f"因子数{len(current_factors)}→{len(new_factors)}")
+            if fund_code and F_remove is not None:
+                print(f"[调整] {fund_code} {target_date} 第{iteration+1}轮: "
+                      f"移除{{{F_remove}}}, 添加{{{F_add}}}, "
+                      f"因子数{len(current_factors)}→{len(new_factors)}")
 
             log['iterations'].append(iter_log)
 
@@ -615,6 +641,11 @@ class DurationModel:
                 if fund_code:
                     self.iteration_logs[fund_code] = log
                 return coef_dict
+
+            # 更新禁止集合：将本轮尝试的所有swap加入禁止集合
+            for swap_pair in current_round_swaps:
+                forbidden_swaps.add(swap_pair)
+            current_round_swaps = []  # 清空本轮记录
 
             # 更新因子池，继续迭代
             current_factors = new_factors

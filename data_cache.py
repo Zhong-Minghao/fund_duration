@@ -47,9 +47,14 @@ class WindDataCache:
         if not path.exists():
             return False
         try:
-            df = pd.read_pickle(path)
+            import pickle
+            with open(path, 'rb') as f:
+                df = pickle.load(f)
             if df.empty:
                 return False
+            # 修复 datetime64[s] 索引格式兼容性问题
+            if df.index.dtype == 'datetime64[s]':
+                df.index = df.index.astype('datetime64[ns]')
             cache_min = df.index.min()
             cache_max = df.index.max()
             return cache_min <= pd.to_datetime(start_date) and cache_max >= pd.to_datetime(end_date)
@@ -62,7 +67,12 @@ class WindDataCache:
         if not path.exists():
             return None
         try:
-            df = pd.read_pickle(path)
+            import pickle
+            with open(path, 'rb') as f:
+                df = pickle.load(f)
+            # 修复 datetime64[s] 索引格式兼容性问题
+            if df.index.dtype == 'datetime64[s]':
+                df.index = df.index.astype('datetime64[ns]')
             mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
             result = df.loc[mask]
             return result if not result.empty else None

@@ -71,12 +71,18 @@ class WindDataCache:
             with open(path, 'rb') as f:
                 df = pickle.load(f)
             # 修复 datetime64[s] 索引格式兼容性问题
-            if df.index.dtype == 'datetime64[s]':
+            if hasattr(df.index, 'dtype') and str(df.index.dtype) == 'datetime64[s]':
+                # 转换为兼容格式
+                df.index = pd.to_datetime(df.index.astype(str))
+            elif hasattr(df.index, 'dtype') and df.index.dtype.name.startswith('datetime64'):
+                # 确保使用纳秒精度
                 df.index = df.index.astype('datetime64[ns]')
             mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
             result = df.loc[mask]
             return result if not result.empty else None
-        except Exception:
+        except Exception as e:
+            # 打印错误信息以便调试，但返回None让调用方从Wind获取
+            print(f"[缓存警告] {fund_code}: 读取缓存失败 ({str(e)[:50]}...), 将从Wind重新获取")
             return None
 
     def write_nav(self, fund_code: str, df: pd.DataFrame):

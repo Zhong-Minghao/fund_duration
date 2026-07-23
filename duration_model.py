@@ -44,6 +44,7 @@ class DurationModel:
         self.outlier_threshold = outlier_threshold
         self.index_smooth_window = index_smooth_window
         self.iteration_logs = {}  # {fund_code: log_dict}，记录每只基金的迭代过程
+        self.final_boundary_status = {}  # {fund_code: 'upper'|'lower'|'interior'}，记录每只基金的最终边界状态
 
     def update_index_processor(self, index_processor):
         """更新index_processor引用"""
@@ -598,6 +599,8 @@ class DurationModel:
                 log['final_coefficients'] = coef_dict
                 if fund_code:
                     self.iteration_logs[fund_code] = log
+                    # Store final boundary status for easy access
+                    self.final_boundary_status[fund_code] = boundary_status
                 return coef_dict
 
             # 在边界上，搜索最优 swap
@@ -640,6 +643,8 @@ class DurationModel:
                 log['final_coefficients'] = coef_dict
                 if fund_code:
                     self.iteration_logs[fund_code] = log
+                    # Store final boundary status for easy access
+                    self.final_boundary_status[fund_code] = boundary_status
                 return coef_dict
 
             # 更新禁止集合：将本轮尝试的所有swap加入禁止集合
@@ -660,6 +665,10 @@ class DurationModel:
             log['final_coefficients'] = dict(zip(current_factors, coefficients)) if coefficients is not None else None
             if fund_code:
                 self.iteration_logs[fund_code] = log
+                # Store final boundary status for easy access (from last iteration)
+                iterations = log.get('iterations', [])
+                if iterations:
+                    self.final_boundary_status[fund_code] = iterations[-1].get('boundary_type')
 
         if coefficients is not None:
             return dict(zip(current_factors, coefficients))
